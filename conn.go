@@ -91,6 +91,9 @@ type Conn struct {
 	retransmission *resendMap
 
 	lastActivity atomic.Pointer[time.Time]
+
+	lastUnreliableSeq uint24
+	lastReliableSeq   uint24
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -216,61 +219,81 @@ func (conn *Conn) checkResend(now time.Time) {
 	_ = conn.resend(resend)
 }
 
-// Write writes a buffer b over the RakNet connection. The amount of bytes
-// written n is always equal to the length of the bytes written if writing was
-// successful. If not, an error is returned and n is 0. Write may be called
-// simultaneously from multiple goroutines, but will write one by one.
-func (conn *Conn) Write(b []byte) (n int, err error) {
+func (conn *Conn) writeWithReliability(payload []byte, rel byte) (int, error) {
+	fragments := split(payload, conn.effectiveMTU())
+
+	msgIdx := conn.messageIndex.Inc()
+	seqIdx := conn.seq.Inc()
+	orderIdx := conn.orderIndex.Inc()
+
+	splitID := uint16(conn.splitID)
+	if len(fragments) > 1 {
+		conn.splitID++
+	}
+
+	total := 0
+	for i, chunk := range fragments {
+		pk := packetPool.Get().(*packet)
+		pk.reliability = rel
+		pk.messageIndex = msgIdx
+		pk.sequenceIndex = seqIdx
+		pk.orderIndex = orderIdx
+
+		if len(fragments) > 1 {
+			pk.split = true
+			pk.splitCount = uint32(len(fragments))
+			pk.splitIndex = uint32(i)
+			pk.splitID = splitID
+		}
+
+		if cap(pk.content) < len(chunk) {
+			pk.content = make([]byte, len(chunk))
+		}
+		pk.content = pk.content[:len(chunk)]
+		copy(pk.content, chunk)
+
+		if err := conn.sendDatagram(pk); err != nil {
+			return total, err
+		}
+		total += len(chunk)
+	}
+	return total, nil
+}
+
+func (conn *Conn) Write(b []byte) (int, error) {
 	select {
 	case <-conn.ctx.Done():
 		return 0, conn.error(net.ErrClosed, "write")
 	default:
 		conn.mu.Lock()
 		defer conn.mu.Unlock()
-		n, err = conn.write(b)
+		n, err := conn.writeWithReliability(b, reliabilityReliableOrdered)
 		return n, conn.error(err, "write")
 	}
 }
 
-// write writes a buffer b over the RakNet connection. The amount of bytes
-// written n is always equal to the length of the bytes written if the write
-// was successful. If not, an error is returned and n is 0. Write may be called
-// simultaneously from multiple goroutines, but will write one by one. Unlike
-// Write, write will not lock.
-func (conn *Conn) write(b []byte) (n int, err error) {
-	fragments := split(b, conn.effectiveMTU())
-	orderIndex := conn.orderIndex.Inc()
+func (conn *Conn) WriteUnreliable(b []byte) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.writeWithReliability(b, reliabilityUnreliable)
+}
 
-	splitID := uint16(conn.splitID)
-	if len(fragments) > 1 {
-		conn.splitID++
-	}
-	for splitIndex, content := range fragments {
-		pk := packetPool.Get().(*packet)
-		if cap(pk.content) < len(content) {
-			pk.content = make([]byte, len(content))
-		}
-		// We set the actual slice size to the same size as the content. It
-		// might be bigger than the previous size, in which case it will grow,
-		// which is fine as the underlying array will always be big enough.
-		pk.content = pk.content[:len(content)]
-		copy(pk.content, content)
+func (conn *Conn) WriteUnreliableSequenced(b []byte) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.writeWithReliability(b, reliabilityUnreliableSequenced)
+}
 
-		pk.orderIndex = orderIndex
-		pk.messageIndex = conn.messageIndex.Inc()
-		if pk.split = len(fragments) > 1; pk.split {
-			// If there were more than one fragment, the pk was split, so we
-			// need to make sure we set the appropriate fields.
-			pk.splitCount = uint32(len(fragments))
-			pk.splitIndex = uint32(splitIndex)
-			pk.splitID = splitID
-		}
-		if err = conn.sendDatagram(pk); err != nil {
-			return 0, err
-		}
-		n += len(content)
-	}
-	return n, nil
+func (conn *Conn) WriteReliable(b []byte) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.writeWithReliability(b, reliabilityReliable)
+}
+
+func (conn *Conn) WriteReliableSequenced(b []byte) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.writeWithReliability(b, reliabilityReliableSequenced)
 }
 
 // Read reads from the connection into the byte slice passed. If successful,
@@ -447,24 +470,44 @@ func (conn *Conn) handleDatagram(b []byte) error {
 // receivePacket handles the receiving of a packet. It puts the packet in the
 // queue and takes out all packets that were obtainable after that, and handles
 // them.
-func (conn *Conn) receivePacket(packet *packet) error {
-	if packet.reliability != reliabilityReliableOrdered {
-		// If it isn't a reliable ordered packet, handle it immediately.
-		return conn.handlePacket(packet.content)
-	}
-	if !conn.packetQueue.put(packet.orderIndex, packet.content) {
-		// An ordered packet arrived twice.
-		return nil
-	}
-	if conn.packetQueue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
-	}
-	for _, content := range conn.packetQueue.fetch() {
-		if err := conn.handlePacket(content); err != nil {
-			return err
+func (conn *Conn) receivePacket(pkt *packet) error {
+	switch pkt.reliability {
+
+	case reliabilityUnreliableSequenced:
+		if pkt.sequenceIndex <= conn.lastUnreliableSeq {
+			return nil
 		}
+		conn.lastUnreliableSeq = pkt.sequenceIndex
+		return conn.handlePacket(pkt.content)
+
+	case reliabilityReliableSequenced:
+		if pkt.sequenceIndex <= conn.lastReliableSeq {
+			return nil
+		}
+		conn.lastReliableSeq = pkt.sequenceIndex
+		return conn.handlePacket(pkt.content)
+
+	case reliabilityUnreliable, reliabilityReliable:
+		return conn.handlePacket(pkt.content)
+
+	case reliabilityReliableOrdered:
+		if !conn.packetQueue.put(pkt.orderIndex, pkt.content) {
+			return nil
+		}
+		if conn.packetQueue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
+			return fmt.Errorf("packet queue window size is too big (%v-%v)",
+				conn.packetQueue.lowest, conn.packetQueue.highest)
+		}
+		for _, content := range conn.packetQueue.fetch() {
+			if err := conn.handlePacket(content); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown reliability flag %v", pkt.reliability)
 	}
-	return nil
 }
 
 var errZeroPacket = errors.New("handle packet: zero packet length")
