@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal/message"
+	"github.com/nnnnt21/go-raknet/internal/message"
 	"hash/crc32"
 	"log/slog"
 	"net"

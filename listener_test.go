@@ -2,7 +2,7 @@ package raknet_test
 
 import (
 	"fmt"
-	"github.com/sandertv/go-raknet"
+	"github.com/nnnnt21/go-raknet"
 	"testing"
 	"time"
 )
