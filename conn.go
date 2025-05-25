@@ -27,6 +27,11 @@ const (
 	maxWindowSize = 2048
 )
 
+type receiptRecord struct {
+	cb       func(bool)
+	deadline time.Time
+}
+
 // Conn represents a connection to a specific client. It is not a real
 // connection, as UDP is connectionless, but rather a connection emulated using
 // RakNet. Methods may be called on Conn from multiple goroutines
@@ -94,6 +99,13 @@ type Conn struct {
 
 	lastUnreliableSeq uint24
 	lastReliableSeq   uint24
+
+	receipts   map[uint24]receiptRecord
+	receiptsMu sync.Mutex
+
+	receiptReaperInterval time.Duration
+	reaperStop            chan struct{}
+	reaperMu              sync.Mutex
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -101,26 +113,97 @@ type Conn struct {
 func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandler) *Conn {
 	mtu = min(max(mtu, minMTUSize), maxMTUSize)
 	c := &Conn{
-		raddr:          raddr,
-		conn:           conn,
-		mtu:            mtu,
-		handler:        h,
-		pk:             new(packet),
-		connected:      make(chan struct{}),
-		packets:        internal.Chan[[]byte](4, 4096),
-		splits:         make(map[uint16][][]byte),
-		win:            newDatagramWindow(),
-		packetQueue:    newPacketQueue(),
-		retransmission: newRecoveryQueue(),
-		buf:            bytes.NewBuffer(make([]byte, 0, mtu-28)), // - headers.
-		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
-		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
+		raddr:                 raddr,
+		conn:                  conn,
+		mtu:                   mtu,
+		handler:               h,
+		pk:                    new(packet),
+		connected:             make(chan struct{}),
+		packets:               internal.Chan[[]byte](4, 4096),
+		splits:                make(map[uint16][][]byte),
+		win:                   newDatagramWindow(),
+		packetQueue:           newPacketQueue(),
+		retransmission:        newRecoveryQueue(),
+		buf:                   bytes.NewBuffer(make([]byte, 0, mtu-28)), // - headers.
+		ackBuf:                bytes.NewBuffer(make([]byte, 0, 128)),
+		nackBuf:               bytes.NewBuffer(make([]byte, 0, 64)),
+		receipts:              make(map[uint24]receiptRecord),
+		receiptReaperInterval: time.Second,
 	}
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
 	t := time.Now()
 	c.lastActivity.Store(&t)
 	go c.startTicking()
+	c.StartReceiptReapear()
 	return c
+}
+
+func (conn *Conn) startReceiptReaper() {
+	ticker := time.NewTicker(conn.receiptReaperInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-conn.ctx.Done():
+			return
+		case <-conn.reaperStop:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			conn.receiptsMu.Lock()
+			for seq, rec := range conn.receipts {
+				if now.After(rec.deadline) {
+					go rec.cb(false)
+					delete(conn.receipts, seq)
+				}
+			}
+			conn.receiptsMu.Unlock()
+		}
+	}
+}
+
+func (conn *Conn) SetReceiptReaperInterval(iv time.Duration) {
+	conn.reaperMu.Lock()
+	defer conn.reaperMu.Unlock()
+
+	conn.receiptReaperInterval = iv
+
+	if conn.reaperStop != nil {
+		close(conn.reaperStop)
+		conn.reaperStop = make(chan struct{})
+		go conn.startReceiptReaper()
+	}
+}
+
+func (conn *Conn) GetReceiptReaperInterval() time.Duration {
+	return conn.receiptReaperInterval
+}
+
+func (conn *Conn) StartReceiptReapear() {
+	conn.reaperMu.Lock()
+	defer conn.reaperMu.Unlock()
+
+	if conn.reaperStop != nil {
+		return
+	}
+	conn.reaperStop = make(chan struct{})
+	go conn.startReceiptReaper()
+}
+
+func (conn *Conn) StopReceiptReapear() {
+	conn.reaperMu.Lock()
+	defer conn.reaperMu.Unlock()
+
+	if conn.reaperStop != nil {
+		close(conn.reaperStop)
+		conn.reaperStop = nil
+	}
+}
+
+func (conn *Conn) IsReceiptReaperRunning() bool {
+	conn.reaperMu.Lock()
+	defer conn.reaperMu.Unlock()
+	return conn.reaperStop != nil
 }
 
 // effectiveMTU returns the mtu size without the space allocated for IP and
@@ -627,6 +710,13 @@ func (conn *Conn) handleACK(b []byte) error {
 		return fmt.Errorf("read ACK: %w", err)
 	}
 	for _, sequenceNumber := range ack.packets {
+		conn.receiptsMu.Lock()
+		if rec, ok := conn.receipts[sequenceNumber]; ok {
+			go rec.cb(true)
+			delete(conn.receipts, sequenceNumber)
+		}
+		conn.receiptsMu.Unlock()
+
 		// Take out all stored packets from the recovery queue.
 		if p, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
 			// Clear the packet and return it to the pool so that it may be
@@ -701,4 +791,114 @@ func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
 // timestamp returns a timestamp in milliseconds.
 func timestamp() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
+}
+
+func (conn *Conn) WriteUnreliableWithAckReceipt(payload []byte, onReceipt func(acked bool), deadline time.Duration) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	seq := conn.seq.Inc()
+
+	conn.receiptsMu.Lock()
+	conn.receipts[seq] = receiptRecord{
+		cb:       onReceipt,
+		deadline: time.Now().Add(deadline),
+	}
+	conn.receiptsMu.Unlock()
+
+	n, err := conn.writeWithReliability(payload, reliabilityUnreliable)
+	if err != nil {
+		conn.receiptsMu.Lock()
+		delete(conn.receipts, seq)
+		conn.receiptsMu.Unlock()
+	}
+	return n, err
+}
+
+func (conn *Conn) WriteUnreliableSequencedWithAckReceipt(payload []byte, onReceipt func(acked bool), deadline time.Duration) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	seq := conn.seq.Inc()
+
+	conn.receiptsMu.Lock()
+	conn.receipts[seq] = receiptRecord{
+		cb:       onReceipt,
+		deadline: time.Now().Add(deadline),
+	}
+	conn.receiptsMu.Unlock()
+
+	n, err := conn.writeWithReliability(payload, reliabilityUnreliableSequenced)
+	if err != nil {
+		conn.receiptsMu.Lock()
+		delete(conn.receipts, seq)
+		conn.receiptsMu.Unlock()
+	}
+	return n, err
+}
+
+func (conn *Conn) WriteReliableWithAckReceipt(payload []byte, onReceipt func(acked bool), deadline time.Duration) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	seq := conn.seq.Inc()
+
+	conn.receiptsMu.Lock()
+	conn.receipts[seq] = receiptRecord{
+		cb:       onReceipt,
+		deadline: time.Now().Add(deadline),
+	}
+	conn.receiptsMu.Unlock()
+
+	n, err := conn.writeWithReliability(payload, reliabilityReliable)
+	if err != nil {
+		conn.receiptsMu.Lock()
+		delete(conn.receipts, seq)
+		conn.receiptsMu.Unlock()
+	}
+	return n, err
+}
+
+func (conn *Conn) WriteReliableOrderedWithAckReceipt(payload []byte, onReceipt func(acked bool), deadline time.Duration) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	seq := conn.seq.Inc()
+
+	conn.receiptsMu.Lock()
+	conn.receipts[seq] = receiptRecord{
+		cb:       onReceipt,
+		deadline: time.Now().Add(deadline),
+	}
+	conn.receiptsMu.Unlock()
+
+	n, err := conn.writeWithReliability(payload, reliabilityReliableOrdered)
+	if err != nil {
+		conn.receiptsMu.Lock()
+		delete(conn.receipts, seq)
+		conn.receiptsMu.Unlock()
+	}
+	return n, err
+}
+
+func (conn *Conn) WriteReliableSequencedWithAckReceipt(payload []byte, onReceipt func(acked bool), deadline time.Duration) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	seq := conn.seq.Inc()
+
+	conn.receiptsMu.Lock()
+	conn.receipts[seq] = receiptRecord{
+		cb:       onReceipt,
+		deadline: time.Now().Add(deadline),
+	}
+	conn.receiptsMu.Unlock()
+
+	n, err := conn.writeWithReliability(payload, reliabilityReliableSequenced)
+	if err != nil {
+		conn.receiptsMu.Lock()
+		delete(conn.receipts, seq)
+		conn.receiptsMu.Unlock()
+	}
+	return n, err
 }

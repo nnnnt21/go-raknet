@@ -1,5 +1,20 @@
 # go-raknet
 
+## This fork bridges the remaining gaps in the reliability flag handling & a basic receipt implementation, probably not too useful for Minecraft
+
+## Implemented Reliability Types
+*   UNRELIABLE
+*   UNRELIABLE_SEQUENCED
+*  RELIABLE
+*  RELIABLE_ORDERED
+*  RELIABLE_SEQUENCED
+#### Receipts
+*  UNRELIABLE_WITH_ACK_RECEIPT
+*   UNRELIABLE_SEQUENCED_WITH_ACK_RECEIPT
+*   RELIABLE_WITH_ACK_RECEIPT
+*   RELIABLE_ORDERED_WITH_ACK_RECEIPT
+*   RELIABLE_SEQUENCED_WITH_ACK_RECEIPT
+
 go-raknet is a library that implements a basic version of the RakNet protocol, which is used for
 Minecraft (Bedrock Edition). It implements Unreliable, Reliable and 
 ReliableOrdered packets and sends user packets as ReliableOrdered.
