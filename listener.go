@@ -188,11 +188,7 @@ func (listener *Listener) listen() {
 				close(listener.incoming)
 				return
 			}
-<<<<<<< HEAD
 			listener.conf.ErrorLog.Error("read from: "+err.Error(), "raddr", addrStr)
-=======
-			listener.conf.ErrorLog.Error("read from: " + err.Error(), "raddr", addrStr)
->>>>>>> 991ee492a9074139fcd281630200ef1334d23dbf
 			continue
 		} else if n == 0 || listener.sec.blocked(addr) {
 			continue
