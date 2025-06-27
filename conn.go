@@ -6,8 +6,6 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
-	"github.com/nnnnt21/go-raknet/internal"
-	"github.com/nnnnt21/go-raknet/internal/message"
 	"io"
 	"net"
 	"net/netip"
@@ -15,6 +13,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/nnnnt21/go-raknet/internal"
+	"github.com/nnnnt21/go-raknet/internal/message"
 )
 
 const (
@@ -305,9 +306,25 @@ func (conn *Conn) checkResend(now time.Time) {
 func (conn *Conn) writeWithReliability(payload []byte, rel byte) (int, error) {
 	fragments := split(payload, conn.effectiveMTU())
 
-	msgIdx := conn.messageIndex.Inc()
-	seqIdx := conn.seq.Inc()
-	orderIdx := conn.orderIndex.Inc()
+	var msgIdx, seqIdx, orderIdx uint24
+
+	switch rel {
+	case reliabilityReliable, reliabilityReliableOrdered, reliabilityReliableSequenced:
+		msgIdx = conn.messageIndex.Inc()
+	default:
+	}
+
+	switch rel {
+	case reliabilityUnreliableSequenced, reliabilityReliableSequenced:
+		seqIdx = conn.seq.Inc()
+	default:
+	}
+
+	switch rel {
+	case reliabilityUnreliableSequenced, reliabilityReliableOrdered, reliabilityReliableSequenced:
+		orderIdx = conn.orderIndex.Inc()
+	default:
+	}
 
 	splitID := uint16(conn.splitID)
 	if len(fragments) > 1 {
@@ -857,6 +874,12 @@ func (conn *Conn) WriteReliableWithAckReceipt(payload []byte, onReceipt func(ack
 		conn.receiptsMu.Unlock()
 	}
 	return n, err
+}
+
+func (conn *Conn) WriteReliableOrdered(b []byte) (int, error) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.writeWithReliability(b, reliabilityReliableOrdered)
 }
 
 func (conn *Conn) WriteReliableOrderedWithAckReceipt(payload []byte, onReceipt func(acked bool), deadline time.Duration) (int, error) {
